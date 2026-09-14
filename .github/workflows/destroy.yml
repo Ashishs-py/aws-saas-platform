@@ -1,0 +1,57 @@
+name: Destroy
+
+# Deliberately manual and gated. Used to tear an environment down cleanly,
+# which is also how demo cost is kept at zero.
+on:
+  workflow_dispatch:
+    inputs:
+      customer:
+        type: choice
+        options: [customer-a, customer-b]
+      environment:
+        type: choice
+        options: [dev, test, prod]
+      confirm:
+        description: Type DESTROY to confirm
+        type: string
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  destroy:
+    if: ${{ inputs.confirm == 'DESTROY' }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read region
+        id: cfg
+        run: |
+          TFVARS="customers/${{ inputs.customer }}/${{ inputs.environment }}.tfvars"
+          echo "region=$(grep -E '^aws_region' "$TFVARS" | awk -F'"' '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ steps.cfg.outputs.region }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+
+      - name: Destroy
+        working-directory: stack
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.TF_STATE_REGION }}" \
+            -backend-config="key=${{ inputs.customer }}/${{ inputs.environment }}/terraform.tfstate" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+          terraform destroy -auto-approve -input=false \
+            -var-file="../customers/${{ inputs.customer }}/${{ inputs.environment }}.tfvars"

@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-checks:
+    name: Lint, validate and scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+
+      - name: Terraform format check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init (no backend)
+        working-directory: stack
+        run: terraform init -backend=false -input=false
+
+      - name: Terraform validate
+        working-directory: stack
+        run: terraform validate
+
+      - name: Validate every customer configuration parses
+        run: |
+          for f in customers/*/*.tfvars; do
+            echo "checking $f"
+            grep -q "customer_code" "$f" || { echo "missing customer_code in $f"; exit 1; }
+            grep -q "aws_region" "$f"    || { echo "missing aws_region in $f"; exit 1; }
+          done
+
+      - name: Security scan (Trivy IaC)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: '0'
+          format: table
+
+      - name: Checkov policy scan
+        run: |
+          pip install --quiet checkov
+          checkov -d . --framework terraform --compact --soft-fail
+
+  docker-build:
+    name: Build application image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (no push)
+        run: docker build -t app:ci ./app

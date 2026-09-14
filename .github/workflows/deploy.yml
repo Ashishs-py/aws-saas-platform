@@ -1,0 +1,196 @@
+name: Deploy
+
+# One pipeline serves every customer and environment. Customer, environment and
+# region come from configuration, never from the workflow body.
+on:
+  workflow_dispatch:
+    inputs:
+      customer:
+        description: Customer configuration directory
+        type: choice
+        options: [customer-a, customer-b]
+        default: customer-a
+      environment:
+        description: Environment
+        type: choice
+        options: [dev, test, prod]
+        default: dev
+      apply:
+        description: Apply the change (unchecked runs plan only)
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write   # required for GitHub OIDC
+  contents: read
+
+env:
+  TF_INPUT: "0"
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  plan:
+    name: Plan ${{ inputs.customer }}/${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    outputs:
+      region: ${{ steps.cfg.outputs.region }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read customer configuration
+        id: cfg
+        run: |
+          TFVARS="customers/${{ inputs.customer }}/${{ inputs.environment }}.tfvars"
+          test -f "$TFVARS" || { echo "missing $TFVARS"; exit 1; }
+          REGION=$(grep -E '^aws_region' "$TFVARS" | awk -F'"' '{print $2}')
+          echo "region=$REGION" >> "$GITHUB_OUTPUT"
+          echo "Target region: $REGION"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ steps.cfg.outputs.region }}
+          role-session-name: gha-plan-${{ inputs.customer }}-${{ inputs.environment }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: stack
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.TF_STATE_REGION }}" \
+            -backend-config="key=${{ inputs.customer }}/${{ inputs.environment }}/terraform.tfstate" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Terraform plan
+        working-directory: stack
+        run: |
+          terraform plan -input=false -lock-timeout=5m \
+            -var-file="../customers/${{ inputs.customer }}/${{ inputs.environment }}.tfvars" \
+            -out=tfplan
+          terraform show -no-color tfplan > plan.txt
+          {
+            echo "### Terraform plan: ${{ inputs.customer }} / ${{ inputs.environment }}"
+            echo '```'
+            tail -c 60000 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy ${{ inputs.customer }}/${{ inputs.environment }}
+    needs: plan
+    if: ${{ inputs.apply }}
+    runs-on: ubuntu-latest
+    # Production maps to a GitHub Environment with required reviewers, which is
+    # the approval gate before any production change.
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ needs.plan.outputs.region }}
+          role-session-name: gha-deploy-${{ inputs.customer }}-${{ inputs.environment }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: stack
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.TF_STATE_REGION }}" \
+            -backend-config="key=${{ inputs.customer }}/${{ inputs.environment }}/terraform.tfstate" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      # Step 1: converge the infrastructure, which creates or updates the ECR
+      # repository the image is then pushed to.
+      - name: Terraform apply (infrastructure)
+        working-directory: stack
+        run: |
+          terraform apply -auto-approve -input=false -lock-timeout=5m \
+            -var-file="../customers/${{ inputs.customer }}/${{ inputs.environment }}.tfvars"
+
+      - name: Read outputs
+        id: tf
+        working-directory: stack
+        run: |
+          echo "ecr=$(terraform output -raw ecr_repository_url)" >> "$GITHUB_OUTPUT"
+          echo "cluster=$(terraform output -raw ecs_cluster_name)" >> "$GITHUB_OUTPUT"
+          echo "service=$(terraform output -raw ecs_service_name)" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        env:
+          ECR: ${{ steps.tf.outputs.ecr }}
+        run: |
+          TAG="${GITHUB_SHA::7}"
+          docker build --build-arg APP_VERSION="$TAG" -t "$ECR:$TAG" -t "$ECR:latest" ./app
+          docker push "$ECR:$TAG"
+          docker push "$ECR:latest"
+          echo "IMAGE=$ECR:$TAG" >> "$GITHUB_ENV"
+
+      # Step 2: roll the new image out through Terraform so state stays truthful.
+      - name: Terraform apply (application release)
+        working-directory: stack
+        run: |
+          terraform apply -auto-approve -input=false -lock-timeout=5m \
+            -var-file="../customers/${{ inputs.customer }}/${{ inputs.environment }}.tfvars" \
+            -var="container_image=${IMAGE}" \
+            -var="health_check_path=/healthz"
+
+      - name: Wait for the service to stabilise
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${{ steps.tf.outputs.cluster }}" \
+            --services "${{ steps.tf.outputs.service }}"
+
+      - name: Smoke test
+        id: smoke
+        working-directory: stack
+        run: |
+          URL=$(terraform output -raw application_url)
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          for i in $(seq 1 20); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' "$URL/healthz" || true)
+            echo "attempt $i -> $CODE"
+            if [ "$CODE" = "200" ]; then
+              curl -s "$URL/healthz"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "smoke test failed"
+          exit 1
+
+      - name: Deployment evidence
+        if: always()
+        working-directory: stack
+        run: |
+          {
+            echo "## Deployment evidence"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Customer | ${{ inputs.customer }} |"
+            echo "| Environment | ${{ inputs.environment }} |"
+            echo "| Region | ${{ needs.plan.outputs.region }} |"
+            echo "| Image | ${IMAGE} |"
+            echo "| URL | ${{ steps.smoke.outputs.url }} |"
+            echo "| Commit | ${GITHUB_SHA} |"
+            echo ""
+            echo '```json'
+            terraform output -json deployment_summary
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
