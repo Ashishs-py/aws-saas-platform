@@ -1,134 +1,240 @@
-# AWS SaaS Platform — reusable landing zone and application platform
+# \# AWS SaaS Platform
 
-A production-shaped AWS environment for a small SaaS company, delivered as Terraform modules and a GitHub Actions pipeline. The same code deploys Customer A in `eu-west-2` at `small` size and Customer B in `eu-west-1` at `medium` size. **Only configuration changes.**
+# 
 
-```
-customers/customer-a/dev.tfvars    ->  custa-dev  eu-west-2  small
-customers/customer-b/dev.tfvars    ->  custb-dev  eu-west-1  medium
-```
+# A reusable AWS environment for a growing SaaS company, built with Terraform and GitHub Actions.
 
-## What it gives the customer
+# 
 
-| Requirement | Delivered by |
-|---|---|
-| Secure AWS environment | Per-environment VPC, private-by-design security groups, KMS CMK with rotation, IAM roles only, CloudTrail, VPC flow logs |
-| Reliable application hosting | ECS Fargate across two AZs behind an ALB, health checks, rolling deploys with automatic rollback |
-| Automated deployments | GitHub Actions with OIDC federation, no AWS keys stored anywhere |
-| Scaling | Target-tracking autoscaling on CPU, min/max per size profile |
-| Monitoring | CloudWatch dashboard, eight alarms, log-based error alerting, SNS to on-call |
-| Backups | AWS Backup vault and tag-driven plan, DynamoDB PITR |
-| Threat detection | GuardDuty with findings routed to the on-call topic, Security Hub FSBP |
-| Reduced operational overhead | No servers, no patching, runbooks for the five situations that actually page someone |
+# The point of this repository is that onboarding a second customer, or a fiftieth, is a configuration change rather than a new project. The same code deploys:
 
-Architecture and design rationale: [ARCHITECTURE.md](ARCHITECTURE.md). Cost model: [COSTS.md](COSTS.md). Runbooks: [docs/runbooks](docs/runbooks/README.md).
+# 
 
-## Repository layout
+# ```
 
-```
-bootstrap/            One-time per AWS account: state bucket + GitHub OIDC role
-stack/                The root module. Composes every module. Deployed per customer/env
-modules/
-  network/            VPC, subnets, routing, optional NAT, S3 endpoint, flow logs
-  security/           KMS CMK, CloudTrail, GuardDuty, Security Hub
-  data/               DynamoDB with KMS and PITR
-  ecr/                Image repository, scan on push, lifecycle policy
-  compute/            ALB, ECS cluster/service/task, IAM roles, autoscaling
-  edge/               WAF managed rules and rate limiting, optional CloudFront
-  observability/      SNS, alarms, dashboard, GuardDuty event routing
-  backup/             Backup vault, plan and tag-based selection
-customers/            One tfvars + one backend config per customer environment
-app/                  Reference container: /, /healthz, /api/items
-.github/workflows/    ci.yml, deploy.yml, destroy.yml
-docs/runbooks/        Operational runbooks
-```
+# customers/customer-a/dev.tfvars   ->  eu-west-2, small profile
 
-## Prerequisites
+# customers/customer-b/dev.tfvars   ->  eu-west-1, medium profile
 
-- An AWS account and a local profile with permission to create IAM, S3, VPC and ECS resources
-- Terraform >= 1.10, AWS CLI v2, Docker, Git
-- A GitHub repository. Make it **public** (or Team/Enterprise) if you want required reviewers on the production environment
+# ```
 
-## 1. Bootstrap (once per AWS account)
+# 
 
-Creates the Terraform state bucket and the IAM role GitHub Actions assumes through OIDC.
+# Different region, different sizing, different network range. No module is edited, no resource is renamed by hand.
 
-```bash
-cd bootstrap
-cp terraform.tfvars.example terraform.tfvars   # set org_prefix, state_region, github owner/repo
-terraform init
-terraform apply
-```
+# 
 
-Record the outputs and set them in GitHub (**Settings → Secrets and variables → Actions**):
+# \## The problem this solves
 
-| GitHub setting | Value |
-|---|---|
-| Secret `AWS_ROLE_ARN` | `github_deploy_role_arn` output |
-| Variable `TF_STATE_BUCKET` | `state_bucket` output |
-| Variable `TF_STATE_REGION` | `state_region` output |
+# 
 
-## 2. Deploy a customer environment
+# A small engineering team with a production web application ends up spending its week on infrastructure instead of the product. They need an environment that is secure by default, deploys itself, scales without anyone watching it, is backed up, and tells someone when it breaks. They do not need a platform team to run it.
 
-From the pipeline (**Actions → Deploy → Run workflow**), choose the customer and environment. Or locally:
+# 
 
-```bash
-cd stack
-terraform init -reconfigure \
-  -backend-config="bucket=<state-bucket>" \
-  -backend-config="region=<state-region>" \
-  -backend-config="key=customer-a/dev/terraform.tfstate" \
-  -backend-config="encrypt=true" \
-  -backend-config="use_lockfile=true"
+# That is what this builds, and it builds the same thing every time.
 
-terraform apply -var-file=../customers/customer-a/dev.tfvars
-terraform output application_url
-```
+# 
 
-The first apply runs a public placeholder image so the environment is provably healthy before any application code exists. The pipeline then builds `app/`, pushes it to ECR and releases it through Terraform.
+# \## What gets deployed
 
-## 3. Deploy a second customer
+# 
 
-```bash
-terraform init -reconfigure -backend-config="key=customer-b/dev/terraform.tfstate" ...
-terraform plan -var-file=../customers/customer-b/dev.tfvars
-```
+# Traffic arrives at an Application Load Balancer sitting in front of AWS WAF, and is served by ECS Fargate tasks spread across two availability zones. The tasks store data in DynamoDB and read their runtime secret from Secrets Manager. Images come from ECR, built and pushed by the pipeline.
 
-Different region, different size, different CIDR, same code. Onboarding customer 10 or customer 50 is two files in `customers/`.
+# 
 
-## Pipeline
+# Around that sit the parts a customer would otherwise have to assemble themselves: a customer-managed KMS key with rotation encrypting everything that supports it, CloudTrail, VPC flow logs, GuardDuty, a CloudWatch dashboard with eight alarms wired to an SNS topic, and AWS Backup running a tag-driven daily plan.
 
-| Stage | Workflow | What it does |
-|---|---|---|
-| Format and lint | `ci.yml` | `terraform fmt -check -recursive` |
-| Validate | `ci.yml` | `terraform validate`, customer config sanity checks |
-| Security scan | `ci.yml` | Trivy IaC scan and Checkov policy scan |
-| Image build | `ci.yml` | Docker build on every pull request |
-| Plan | `deploy.yml` | Plan written to the job summary as the change record |
-| Approval | `deploy.yml` | GitHub Environment `prod` with required reviewers |
-| Deploy | `deploy.yml` | Terraform apply, build and push image, release through Terraform |
-| Smoke test | `deploy.yml` | Polls `/healthz` until 200 or fails the run |
-| Evidence | `deploy.yml` | Customer, environment, region, image, URL, commit and outputs in the summary |
+# 
 
-## Security posture
+# Sizing is a profile, not a rewrite. `small` runs a single Spot task with no NAT gateway. `medium` runs two on-demand tasks in private subnets behind NAT, with Container Insights and longer retention. `large` adds a third AZ. The profiles live in `stack/locals.tf` and are the only place capacity decisions are made.
 
-- **No static AWS credentials.** GitHub Actions authenticates with OIDC; the trust policy is scoped to this repository, the `main` branch, its environments and pull requests.
-- **Encryption everywhere.** Customer-managed KMS key with rotation for DynamoDB, ECR, CloudWatch Logs, SNS, Secrets Manager and the backup vault. TLS-only bucket policies.
-- **Least privilege at runtime.** The task role can touch one DynamoDB table; the execution role can read one secret and decrypt with one key.
-- **Network.** The ALB is the only public entry point. Tasks accept traffic from the ALB security group alone. Flow logs capture rejected traffic.
-- **Detection.** GuardDuty findings of severity 4 and above reach on-call through EventBridge and SNS within minutes.
-- **No customer names, account IDs or regions in code.** Account ID comes from `aws_caller_identity`; everything else is a variable.
+# 
 
-## Tear down
+# Design reasoning is in \[ARCHITECTURE.md](ARCHITECTURE.md), costs in \[COSTS.md](COSTS.md), operations in \[docs/runbooks](docs/runbooks/README.md).
 
-```bash
-cd stack && terraform destroy -var-file=../customers/customer-a/dev.tfvars
-```
+# 
 
-Full checklist, including the per-region security services: [docs/runbooks/decommission.md](docs/runbooks/decommission.md).
+# \## How it is put together
 
-## Roadmap toward AWS Marketplace
+# 
 
-1. Package the stack behind a thin `customer` wrapper module published to a private Terraform registry, versioned with semantic tags.
-2. Add a Service Catalog product and CloudFormation launch wrapper so a buyer can subscribe and launch into their own account.
-3. Move from one account with many stacks to one account per customer under AWS Organizations and Control Tower, with this stack as the workload baseline.
-4. Add per-customer metering tags and a cost allocation report as the basis for a Marketplace SaaS listing.
+# ```
+
+# bootstrap/      Run once per AWS account: state bucket and the CI IAM role
+
+# stack/          The root module. Composes everything. Deployed per customer/env
+
+# modules/        network, security, data, ecr, compute, edge, observability, backup
+
+# customers/      One tfvars and one state key per customer environment
+
+# app/            Reference container: /, /healthz, /api/items
+
+# .github/        CI, deploy and destroy workflows
+
+# docs/runbooks/  What to do at 3am
+
+# ```
+
+# 
+
+# No account ID, customer name or region appears anywhere in `modules/` or `stack/`. The account ID comes from `aws\_caller\_identity` at plan time; everything else is a variable with a validated value.
+
+# 
+
+# \## Running it
+
+# 
+
+# \*\*Once per AWS account\*\*, create the shared state bucket and the role GitHub assumes:
+
+# 
+
+# ```bash
+
+# cd bootstrap
+
+# cp terraform.tfvars.example terraform.tfvars   # org prefix, state region, GitHub owner/repo
+
+# terraform init \&\& terraform apply
+
+# ```
+
+# 
+
+# Put the three outputs into GitHub under Settings, Secrets and variables, Actions: the role ARN as a secret, and the state bucket and region as variables.
+
+# 
+
+# \*\*Per customer environment\*\*, either run the Deploy workflow and pick the customer and environment, or locally:
+
+# 
+
+# ```bash
+
+# cd stack
+
+# terraform init -reconfigure \\
+
+# &#x20; -backend-config="bucket=<state-bucket>" \\
+
+# &#x20; -backend-config="region=<state-region>" \\
+
+# &#x20; -backend-config="key=customer-a/dev/terraform.tfstate" \\
+
+# &#x20; -backend-config="encrypt=true" -backend-config="use\_lockfile=true"
+
+# 
+
+# terraform apply -var-file=../customers/customer-a/dev.tfvars
+
+# terraform output application\_url
+
+# ```
+
+# 
+
+# The first apply runs a public placeholder image on the application port, so the network path, load balancer, health checks and task placement are proven healthy before any application code exists. The pipeline then builds `app/`, pushes it to ECR and releases it through Terraform, so state always matches what is actually running.
+
+# 
+
+# On Windows there are wrappers in `scripts/`: `deploy.cmd customer-a dev`, `plan.cmd customer-b dev`, `destroy.cmd customer-a dev`, and `whats-running.cmd eu-west-2` to confirm nothing billable is left behind.
+
+# 
+
+# \## The pipeline
+
+# 
+
+# A pull request runs format checks, `terraform validate`, a Trivy IaC scan, a Checkov policy scan and a Docker build.
+
+# 
+
+# A deployment runs a plan first and writes it to the job summary as the change record. Production deployments then stop at a GitHub Environment with a required reviewer. After approval it applies the infrastructure, builds and pushes the image, applies again to release it, waits for the ECS service to stabilise, polls `/healthz` until it answers, and finally writes an evidence table with the customer, environment, region, image tag, URL and commit.
+
+# 
+
+# If a release never becomes healthy, the ECS deployment circuit breaker rolls it back without anyone intervening.
+
+# 
+
+# \## Security decisions worth calling out
+
+# 
+
+# \*\*No static AWS credentials in the target design.\*\* The bootstrap stack provisions a GitHub OIDC provider and a role whose trust policy is scoped to this repository, so the pipeline exchanges a short-lived GitHub token for AWS credentials with nothing stored.
+
+# 
+
+# \*\*The blast radius of a task is one table.\*\* The task role can read and write a single DynamoDB table and decrypt with a single key. The execution role can read one secret. Nothing has wildcard resource access.
+
+# 
+
+# \*\*The ALB is the only way in.\*\* The task security group accepts traffic from the ALB security group and nothing else. Where CloudFront is enabled, the ALB rejects any request that does not carry a secret origin header, so the edge cannot be bypassed by hitting the load balancer directly.
+
+# 
+
+# \*\*Separate state per customer.\*\* One key per customer environment, in a versioned, encrypted, TLS-only bucket with native locking. A mistake in one customer cannot touch another's state.
+
+# 
+
+# \## Trade-offs I made deliberately
+
+# 
+
+# \*\*No NAT gateway in the small profile.\*\* A NAT gateway costs about as much per month as the rest of a small environment combined. Tasks run in public subnets with a public IP for image pulls, but no inbound path exists because the security group only admits the ALB. The medium and large profiles flip one flag and move the tasks into private subnets.
+
+# 
+
+# \*\*DynamoDB rather than RDS.\*\* The reference workload is key-value, and on-demand billing removes idle instance cost, failover operations and patching. Where a customer needs relational features, the `data` module is swapped for an RDS module and nothing else in the stack moves.
+
+# 
+
+# \*\*Fargate rather than EKS.\*\* A team with no platform capacity should not be running nodes or a control plane. EKS earns its complexity once there is multi-tenant scheduling or a service mesh to justify it; at this customer size it is overhead.
+
+# 
+
+# \*\*Fargate Spot in non-production.\*\* Roughly seventy percent cheaper, and an interrupted dev task is not an incident.
+
+# 
+
+# \*\*Regional WAF on the ALB rather than only at CloudFront.\*\* The origin stays protected whether or not a given customer has CloudFront turned on.
+
+# 
+
+# \## What is not here yet
+
+# 
+
+# Custom domains with Route 53 and ACM, which need a domain to exist first. ALB access logs to S3. AWS Config conformance packs. Per-customer AWS Budgets. Blue/green releases through CodeDeploy.
+
+# 
+
+# The larger one: in production each customer would get their own AWS account under Organizations and Control Tower, with this stack as the workload baseline. This repository deploys multiple isolated stacks into a single account, which is the right shape for a demonstration and the wrong shape for a real multi-customer business. The change is to the account model, not to this code.
+
+# 
+
+# \## Tearing it down
+
+# 
+
+# ```bash
+
+# cd stack \&\& terraform destroy -var-file=../customers/customer-a/dev.tfvars
+
+# ```
+
+# 
+
+# Full checklist including the per-region security services: \[docs/runbooks/decommission.md](docs/runbooks/decommission.md).
+
+# 
+
+# \## Toward a Marketplace listing
+
+# 
+
+# Package the stack behind a thin per-customer wrapper module in a private Terraform registry, versioned with semantic tags. Add a Service Catalog product and a CloudFormation launch wrapper so a buyer can subscribe and launch into their own account. Move to one account per customer under Control Tower. Add per-customer metering tags and cost allocation reporting as the basis for a SaaS listing.
+
