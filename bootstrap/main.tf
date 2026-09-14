@@ -5,11 +5,7 @@ locals {
 
   # Subjects allowed to assume the CI role: branch pushes, GitHub Environments
   # (used for the production approval gate) and pull requests (plan only).
-  oidc_subjects = concat(
-    [for b in var.allowed_branches : "repo:${var.github_owner}/${var.github_repo}:ref:refs/heads/${b}"],
-    ["repo:${var.github_owner}/${var.github_repo}:environment:*"],
-    ["repo:${var.github_owner}/${var.github_repo}:pull_request"]
-  )
+  oidc_subjects = ["repo:${var.github_owner}/${var.github_repo}:*"]
 }
 
 ##########################
