@@ -51,7 +51,6 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ steps.cfg.outputs.region }}
-          
 
       - uses: hashicorp/setup-terraform@v3
         with:
@@ -95,9 +94,9 @@ jobs:
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ needs.plan.outputs.region }}
-          role-session-name: gha-deploy-${{ inputs.customer }}-${{ inputs.environment }}
 
       - uses: hashicorp/setup-terraform@v3
         with:
@@ -176,7 +175,7 @@ jobs:
           exit 1
 
       - name: Deployment evidence
-        if: always()
+        if: success()
         working-directory: stack
         run: |
           {
